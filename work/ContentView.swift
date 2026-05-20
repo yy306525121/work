@@ -13,6 +13,8 @@ import UniformTypeIdentifiers
 private enum SidebarSelection: Hashable {
     case entries
     case projects
+    case dailyReport
+    case sync
 }
 
 struct ContentView: View {
@@ -32,6 +34,13 @@ struct ContentView: View {
     @State private var useEndDate = false
     @State private var startDate = Date()
     @State private var endDate = Date()
+    @State private var automaticBackupTask: Task<Void, Never>?
+    @State private var automaticBackupStatus: String?
+
+    @AppStorage("webdav.serverURL") private var webDAVServerURL = ""
+    @AppStorage("webdav.remotePath") private var webDAVRemotePath = "worklog-backup"
+    @AppStorage("webdav.username") private var webDAVUsername = ""
+    @AppStorage("webdav.authMode") private var webDAVAuthModeRawValue = WebDAVAuthMode.basic.rawValue
 
     private var filteredEntries: [WorkLogEntry] {
         let filter = WorkLogFilter(
@@ -51,6 +60,10 @@ struct ContentView: View {
                     .tag(SidebarSelection.entries)
                 Label("项目管理", systemImage: "folder")
                     .tag(SidebarSelection.projects)
+                Label("日报生成", systemImage: "doc.text.below.ecg")
+                    .tag(SidebarSelection.dailyReport)
+                Label("同步设置", systemImage: "arrow.triangle.2.circlepath")
+                    .tag(SidebarSelection.sync)
             }
             .navigationTitle("工作台")
             .navigationSplitViewColumnWidth(min: 180, ideal: 210)
@@ -72,7 +85,15 @@ struct ContentView: View {
                     endDate: $endDate
                 )
             case .projects:
-                ProjectsView(projects: projects, entries: entries)
+                ProjectsView(projects: projects, entries: entries, onDataChanged: scheduleAutomaticBackup)
+            case .dailyReport:
+                DailyReportView(entries: entries)
+            case .sync:
+                WebDAVSyncSettingsView(
+                    projects: projects,
+                    entries: entries,
+                    automaticBackupStatus: automaticBackupStatus
+                )
             }
         }
         .onAppear(perform: migrateLegacyEntriesIfNeeded)
@@ -127,6 +148,7 @@ struct ContentView: View {
         modelContext.insert(entry)
         replaceDayItems(for: entry, with: draft.dayItems, keepsAttachments: draft.type == .requirement)
         selectedEntry = entry
+        scheduleAutomaticBackup()
     }
 
     private func update(entry: WorkLogEntry, with draft: WorkLogEntryDraft) {
@@ -147,6 +169,7 @@ struct ContentView: View {
 
         replaceDayItems(for: entry, with: draft.dayItems, keepsAttachments: draft.type == .requirement)
         selectedEntry = entry
+        scheduleAutomaticBackup()
     }
 
     private func replaceDayItems(for entry: WorkLogEntry, with dayItems: [WorkLogDayItemDraft], keepsAttachments: Bool) {
@@ -213,6 +236,53 @@ struct ContentView: View {
 
         modelContext.delete(entry)
         entryPendingDeletion = nil
+        scheduleAutomaticBackup()
+    }
+
+    private func scheduleAutomaticBackup() {
+        guard webDAVConfiguration.isReady else { return }
+
+        automaticBackupTask?.cancel()
+        automaticBackupStatus = "等待自动备份..."
+
+        let configuration = webDAVConfiguration
+
+        automaticBackupTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+
+            do {
+                let secret = try WebDAVCredentialStore.shared.loadSecret()
+                guard let secret, !secret.isEmpty else {
+                    await MainActor.run {
+                        automaticBackupStatus = "自动备份未执行：请先保存密码或 Token"
+                    }
+                    return
+                }
+
+                let client = WebDAVClient(configuration: configuration, secret: secret)
+                let service = WebDAVBackupService(client: client)
+                let package = WorkLogBackupCodec.export(projects: projects, entries: entries)
+                try await service.upload(package)
+
+                await MainActor.run {
+                    automaticBackupStatus = "自动备份完成：\(package.manifest.generatedAt.formatted(date: .numeric, time: .standard))"
+                }
+            } catch {
+                await MainActor.run {
+                    automaticBackupStatus = "自动备份失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private var webDAVConfiguration: WebDAVConfiguration {
+        WebDAVConfiguration(
+            serverURL: webDAVServerURL,
+            remotePath: webDAVRemotePath,
+            username: webDAVUsername,
+            authMode: WebDAVAuthMode(rawValue: webDAVAuthModeRawValue) ?? .basic
+        )
     }
 }
 
@@ -583,6 +653,7 @@ private struct ProjectsView: View {
 
     let projects: [Project]
     let entries: [WorkLogEntry]
+    let onDataChanged: () -> Void
 
     @State private var newProjectName = ""
     @State private var projectError: String?
@@ -645,15 +716,336 @@ private struct ProjectsView: View {
         modelContext.insert(Project(name: newProjectName))
         newProjectName = ""
         projectError = nil
+        onDataChanged()
     }
 
     private func delete(_ project: Project) {
         guard entryCount(for: project) == 0 else { return }
         modelContext.delete(project)
+        onDataChanged()
     }
 
     private func entryCount(for project: Project) -> Int {
         entries.filter { $0.project === project }.count
+    }
+}
+
+private struct WebDAVSyncSettingsView: View {
+    @Environment(\.modelContext) private var modelContext
+
+    let projects: [Project]
+    let entries: [WorkLogEntry]
+    let automaticBackupStatus: String?
+
+    @AppStorage("webdav.serverURL") private var serverURL = ""
+    @AppStorage("webdav.remotePath") private var remotePath = "worklog-backup"
+    @AppStorage("webdav.username") private var username = ""
+    @AppStorage("webdav.authMode") private var authModeRawValue = WebDAVAuthMode.basic.rawValue
+
+    @State private var secret = ""
+    @State private var statusText = ""
+    @State private var isWorking = false
+    @State private var isConfirmingRestore = false
+
+    private var authMode: WebDAVAuthMode {
+        get { WebDAVAuthMode(rawValue: authModeRawValue) ?? .basic }
+        nonmutating set { authModeRawValue = newValue.rawValue }
+    }
+
+    var body: some View {
+        Form {
+            Section("WebDAV 连接") {
+                TextField("服务地址，例如 https://example.com/dav", text: $serverURL)
+                TextField("远端目录", text: $remotePath)
+                TextField("用户名", text: $username)
+
+                Picker("认证方式", selection: Binding(get: { authMode }, set: { authMode = $0 })) {
+                    ForEach(WebDAVAuthMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                SecureField(authMode == .basic ? "密码" : "Token", text: $secret)
+
+                HStack {
+                    Button {
+                        saveSecret()
+                    } label: {
+                        Label("保存凭据", systemImage: "key")
+                    }
+
+                    Button {
+                        runTask(testConnection)
+                    } label: {
+                        Label("测试连接", systemImage: "network")
+                    }
+                    .disabled(isWorking)
+                }
+            }
+
+            Section("备份与恢复") {
+                HStack {
+                    Button {
+                        runTask(backupNow)
+                    } label: {
+                        Label("立即备份", systemImage: "arrow.up.doc")
+                    }
+                    .disabled(isWorking)
+
+                    Button(role: .destructive) {
+                        isConfirmingRestore = true
+                    } label: {
+                        Label("从 WebDAV 恢复", systemImage: "arrow.down.doc")
+                    }
+                    .disabled(isWorking)
+                }
+
+                LabeledContent("本地数据") {
+                    Text("\(projects.count) 个项目，\(entries.count) 条工作记录")
+                }
+
+                if let automaticBackupStatus, !automaticBackupStatus.isEmpty {
+                    LabeledContent("自动备份") {
+                        Text(automaticBackupStatus)
+                    }
+                }
+
+                if !statusText.isEmpty {
+                    Text(statusText)
+                        .foregroundStyle(statusText.contains("失败") || statusText.contains("错误") ? .red : .secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding(18)
+        .navigationTitle("同步设置")
+        .background(Color(nsColor: .windowBackgroundColor))
+        .task {
+            if secret.isEmpty {
+                secret = (try? WebDAVCredentialStore.shared.loadSecret()) ?? ""
+            }
+        }
+        .alert("从 WebDAV 恢复", isPresented: $isConfirmingRestore) {
+            Button("取消", role: .cancel) {}
+            Button("覆盖本地数据", role: .destructive) {
+                runTask(restoreFromWebDAV)
+            }
+        } message: {
+            Text("恢复会先清空当前本地工作记录、项目和附件，再使用 WebDAV 上的备份重建数据。")
+        }
+    }
+
+    private func saveSecret() {
+        do {
+            try WebDAVCredentialStore.shared.saveSecret(secret)
+            statusText = "凭据已保存"
+        } catch {
+            statusText = "凭据保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func runTask(_ operation: @escaping () async throws -> String) {
+        isWorking = true
+        statusText = "处理中..."
+
+        Task {
+            do {
+                let message = try await operation()
+                await MainActor.run {
+                    statusText = message
+                    isWorking = false
+                }
+            } catch {
+                await MainActor.run {
+                    statusText = "操作失败：\(error.localizedDescription)"
+                    isWorking = false
+                }
+            }
+        }
+    }
+
+    private func testConnection() async throws -> String {
+        try await makeClient().testConnection()
+        return "连接成功"
+    }
+
+    private func backupNow() async throws -> String {
+        let package = WorkLogBackupCodec.export(projects: projects, entries: entries)
+        try await WebDAVBackupService(client: makeClient()).upload(package)
+        return "备份完成：\(package.manifest.projectCount) 个项目，\(package.manifest.entryCount) 条工作记录，\(package.manifest.attachmentCount) 个附件"
+    }
+
+    private func restoreFromWebDAV() async throws -> String {
+        let package = try await WebDAVBackupService(client: makeClient()).download()
+
+        await MainActor.run {
+            WorkLogBackupCodec.restore(package, into: modelContext)
+        }
+
+        return "恢复完成：\(package.manifest.projectCount) 个项目，\(package.manifest.entryCount) 条工作记录，\(package.manifest.attachmentCount) 个附件"
+    }
+
+    private func makeClient() throws -> WebDAVClient {
+        let currentSecret = try WebDAVCredentialStore.shared.loadSecret() ?? secret
+        guard !currentSecret.isEmpty else {
+            throw WebDAVError.missingSecret
+        }
+
+        return WebDAVClient(
+            configuration: WebDAVConfiguration(
+                serverURL: serverURL,
+                remotePath: remotePath,
+                username: username,
+                authMode: authMode
+            ),
+            secret: currentSecret
+        )
+    }
+}
+
+private struct DailyReportView: View {
+    let entries: [WorkLogEntry]
+
+    @AppStorage("dailyReport.baseURL") private var baseURL = "https://api.openai.com"
+    @AppStorage("dailyReport.model") private var model = "gpt-4o-mini"
+    @AppStorage("dailyReport.template") private var template = DailyReportTemplate.defaultText
+
+    @State private var selectedDate = Date()
+    @State private var apiKey = ""
+    @State private var statusText = ""
+    @State private var isWorking = false
+
+    private var input: DailyReportInput {
+        DailyReportCollector.input(for: selectedDate, entries: entries)
+    }
+
+    private var canGenerate: Bool {
+        !isWorking &&
+            !input.items.isEmpty &&
+            DailyReportAIConfiguration(baseURL: baseURL, model: model).isReady
+    }
+
+    var body: some View {
+        Form {
+            Section("日报范围") {
+                DatePicker("日报日期", selection: $selectedDate, displayedComponents: .date)
+
+                LabeledContent("当天工作") {
+                    Text(input.items.isEmpty ? "没有工作记录" : "\(input.items.count) 项，\(input.totalHours, specifier: "%.1f") 小时")
+                }
+            }
+
+            Section("日报模板") {
+                TextEditor(text: $template)
+                    .font(.body)
+                    .frame(minHeight: 180)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(nsColor: .separatorColor))
+                    )
+
+                HStack {
+                    Text("支持 {date}、{weekday}、{workItems}、{totalHours}")
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button {
+                        template = DailyReportTemplate.defaultText
+                    } label: {
+                        Label("恢复默认模板", systemImage: "arrow.counterclockwise")
+                    }
+                }
+            }
+
+            Section("AI 配置") {
+                TextField("服务地址，例如 https://api.openai.com", text: $baseURL)
+                TextField("模型，例如 gpt-4o-mini", text: $model)
+                SecureField("API Key", text: $apiKey)
+
+                HStack {
+                    Button {
+                        saveAPIKey()
+                    } label: {
+                        Label("保存 API Key", systemImage: "key")
+                    }
+
+                    Button {
+                        runGenerate()
+                    } label: {
+                        Label(isWorking ? "生成中..." : "生成并复制", systemImage: "doc.on.clipboard")
+                    }
+                    .disabled(!canGenerate)
+                    .keyboardShortcut(.defaultAction)
+                    .help(input.items.isEmpty ? "当天没有工作记录" : "调用 AI 生成日报并复制到剪贴板")
+                }
+            }
+
+            if !statusText.isEmpty {
+                Section("状态") {
+                    Text(statusText)
+                        .foregroundStyle(statusText.contains("失败") || statusText.contains("请先") || statusText.contains("没有") ? .red : .secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding(18)
+        .navigationTitle("日报生成")
+        .background(Color(nsColor: .windowBackgroundColor))
+        .task {
+            if apiKey.isEmpty {
+                apiKey = (try? DailyReportCredentialStore.shared.loadAPIKey()) ?? ""
+            }
+        }
+    }
+
+    private func saveAPIKey() {
+        do {
+            try DailyReportCredentialStore.shared.saveAPIKey(apiKey)
+            statusText = "API Key 已保存"
+        } catch {
+            statusText = "API Key 保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func runGenerate() {
+        guard !input.items.isEmpty else {
+            statusText = DailyReportError.missingWorkItems.localizedDescription
+            return
+        }
+
+        isWorking = true
+        statusText = "正在生成日报..."
+        let prompt = DailyReportTemplate.render(template, input: input)
+        let configuration = DailyReportAIConfiguration(baseURL: baseURL, model: model)
+        let currentAPIKey = apiKey
+
+        Task {
+            do {
+                let savedAPIKey = try DailyReportCredentialStore.shared.loadAPIKey() ?? ""
+                let effectiveAPIKey = currentAPIKey.isEmpty ? savedAPIKey : currentAPIKey
+                let client = DailyReportAIClient(configuration: configuration, apiKey: effectiveAPIKey)
+                let report = try await client.generateReport(prompt: prompt)
+
+                await MainActor.run {
+                    copyToPasteboard(report)
+                    statusText = "日报已生成并复制到剪贴板"
+                    isWorking = false
+                }
+            } catch {
+                await MainActor.run {
+                    statusText = "生成失败：\(error.localizedDescription)"
+                    isWorking = false
+                }
+            }
+        }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 }
 
