@@ -12,7 +12,10 @@ import SwiftData
 struct workApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            Project.self,
+            WorkLogEntry.self,
+            WorkLogDayItem.self,
+            WorkLogAttachment.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
