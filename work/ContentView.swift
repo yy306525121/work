@@ -1072,7 +1072,6 @@ private struct WorkLogEntryFormView: View {
     @State private var ticketNumber: String
     @State private var dayItems: [WorkLogDayItemDraft]
     @State private var errors: [String] = []
-    @State private var importingDayID: UUID?
 
     init(projects: [Project], entry: WorkLogEntry?, onSave: @escaping (WorkLogEntryDraft) -> Void) {
         self.projects = projects
@@ -1107,13 +1106,6 @@ private struct WorkLogEntryFormView: View {
                 )
             })
         }
-    }
-
-    private var isImportingAttachments: Binding<Bool> {
-        Binding(
-            get: { importingDayID != nil },
-            set: { if !$0 { importingDayID = nil } }
-        )
     }
 
     var body: some View {
@@ -1159,16 +1151,19 @@ private struct WorkLogEntryFormView: View {
                 }
 
                 Section("每日明细") {
-                    ForEach($dayItems) { $dayItem in
+                    ForEach(dayItems) { dayItem in
                         DayItemFormSection(
-                            dayItem: $dayItem,
+                            dayItem: dayItemBinding(for: dayItem),
                             showsAttachments: type == .requirement,
                             canDelete: dayItems.count > 1,
                             onDelete: {
-                                dayItems.removeAll { $0.id == dayItem.id }
+                                removeDayItem(id: dayItem.id)
                             },
                             onAddAttachments: {
-                                importingDayID = dayItem.id
+                                importAttachmentsFromPanel(for: dayItem.id)
+                            },
+                            onPasteAttachments: {
+                                pasteAttachments(for: dayItem.id)
                             }
                         )
                     }
@@ -1203,13 +1198,6 @@ private struct WorkLogEntryFormView: View {
                 }
             }
         }
-        .fileImporter(
-            isPresented: isImportingAttachments,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: true
-        ) { result in
-            importAttachments(result)
-        }
     }
 
     private func addDayItem() {
@@ -1222,39 +1210,58 @@ private struct WorkLogEntryFormView: View {
         dayItems.append(WorkLogDayItemDraft(workDate: nextDate, detail: "", hours: 1))
     }
 
-    private func importAttachments(_ result: Result<[URL], Error>) {
-        guard let importingDayID,
-              let index = dayItems.firstIndex(where: { $0.id == importingDayID }) else {
-            return
-        }
+    private func removeDayItem(id: UUID) {
+        guard dayItems.count > 1 else { return }
+        dayItems.removeAll { $0.id == id }
+    }
 
-        defer {
-            self.importingDayID = nil
-        }
+    private func dayItemBinding(for item: WorkLogDayItemDraft) -> Binding<WorkLogDayItemDraft> {
+        Binding(
+            get: {
+                dayItems.first { $0.id == item.id } ?? item
+            },
+            set: { updatedItem in
+                guard let index = dayItems.firstIndex(where: { $0.id == item.id }) else { return }
+                dayItems[index] = updatedItem
+            }
+        )
+    }
+
+    private func importAttachmentsFromPanel(for dayID: UUID) {
+        let panel = NSOpenPanel()
+        panel.title = "选择成果物"
+        panel.prompt = "添加"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+
+        guard panel.runModal() == .OK else { return }
 
         do {
-            for url in try result.get() {
-                let hasAccess = url.startAccessingSecurityScopedResource()
-                defer {
-                    if hasAccess {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-
-                let data = try Data(contentsOf: url)
-                let contentType = UTType(filenameExtension: url.pathExtension)?.identifier ?? "application/octet-stream"
-                dayItems[index].attachments.append(
-                    WorkLogAttachmentDraft(
-                        fileName: url.lastPathComponent,
-                        contentType: contentType,
-                        data: data,
-                        createdAt: .now
-                    )
-                )
-            }
+            try appendAttachments(try AttachmentDraftFactory.drafts(from: panel.urls), to: dayID)
         } catch {
             errors = ["附件导入失败：\(error.localizedDescription)"]
         }
+    }
+
+    private func pasteAttachments(for dayID: UUID) {
+        do {
+            let drafts = try AttachmentDraftFactory.drafts(from: NSPasteboard.general)
+            guard !drafts.isEmpty else {
+                errors = ["剪贴板中没有可保存的成果物"]
+                return
+            }
+
+            try appendAttachments(drafts, to: dayID)
+        } catch {
+            errors = ["剪贴板导入失败：\(error.localizedDescription)"]
+        }
+    }
+
+    private func appendAttachments(_ attachments: [WorkLogAttachmentDraft], to dayID: UUID) throws {
+        guard let index = dayItems.firstIndex(where: { $0.id == dayID }) else { return }
+        dayItems[index].attachments.append(contentsOf: attachments)
+        errors = []
     }
 
     private func save() {
@@ -1296,6 +1303,7 @@ private struct DayItemFormSection: View {
     let canDelete: Bool
     let onDelete: () -> Void
     let onAddAttachments: () -> Void
+    let onPasteAttachments: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1336,7 +1344,8 @@ private struct DayItemFormSection: View {
             if showsAttachments {
                 AttachmentPickerSection(
                     attachments: $dayItem.attachments,
-                    onAddAttachments: onAddAttachments
+                    onAddAttachments: onAddAttachments,
+                    onPasteAttachments: onPasteAttachments
                 )
             }
         }
@@ -1347,6 +1356,7 @@ private struct DayItemFormSection: View {
 private struct AttachmentPickerSection: View {
     @Binding var attachments: [WorkLogAttachmentDraft]
     let onAddAttachments: () -> Void
+    let onPasteAttachments: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1355,6 +1365,12 @@ private struct AttachmentPickerSection: View {
                     .foregroundStyle(.secondary)
 
                 Spacer()
+
+                Button {
+                    onPasteAttachments()
+                } label: {
+                    Label("粘贴成果物", systemImage: "doc.on.clipboard")
+                }
 
                 Button {
                     onAddAttachments()
@@ -1397,6 +1413,100 @@ private struct AttachmentPickerSection: View {
                 }
             }
         }
+    }
+}
+
+private enum AttachmentDraftFactory {
+    static func drafts(from urls: [URL]) throws -> [WorkLogAttachmentDraft] {
+        try urls.map { url in
+            let hasAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if hasAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            return WorkLogAttachmentDraft(
+                fileName: url.lastPathComponent,
+                contentType: UTType(filenameExtension: url.pathExtension)?.identifier ?? "application/octet-stream",
+                data: try Data(contentsOf: url),
+                createdAt: .now
+            )
+        }
+    }
+
+    static func drafts(from pasteboard: NSPasteboard) throws -> [WorkLogAttachmentDraft] {
+        if let nsURLs = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [NSURL] {
+            let urls = nsURLs.compactMap { $0 as URL }
+            guard !urls.isEmpty else { return [] }
+            return try drafts(from: urls)
+        }
+
+        if let pngData = imagePNGData(from: pasteboard) {
+            return [
+                WorkLogAttachmentDraft(
+                    fileName: timestampedFileName(prefix: "粘贴图片", fileExtension: "png"),
+                    contentType: UTType.png.identifier,
+                    data: pngData,
+                    createdAt: .now
+                )
+            ]
+        }
+
+        if let pdfData = pasteboard.data(forType: .pdf) {
+            return [
+                WorkLogAttachmentDraft(
+                    fileName: timestampedFileName(prefix: "粘贴文档", fileExtension: "pdf"),
+                    contentType: UTType.pdf.identifier,
+                    data: pdfData,
+                    createdAt: .now
+                )
+            ]
+        }
+
+        if let rtfData = pasteboard.data(forType: .rtf) {
+            return [
+                WorkLogAttachmentDraft(
+                    fileName: timestampedFileName(prefix: "粘贴文本", fileExtension: "rtf"),
+                    contentType: UTType.rtf.identifier,
+                    data: rtfData,
+                    createdAt: .now
+                )
+            ]
+        }
+
+        if let text = pasteboard.string(forType: .string),
+           let data = text.data(using: .utf8) {
+            return [
+                WorkLogAttachmentDraft(
+                    fileName: timestampedFileName(prefix: "粘贴文本", fileExtension: "txt"),
+                    contentType: UTType.plainText.identifier,
+                    data: data,
+                    createdAt: .now
+                )
+            ]
+        }
+
+        return []
+    }
+
+    private static func imagePNGData(from pasteboard: NSPasteboard) -> Data? {
+        guard let image = NSImage(pasteboard: pasteboard),
+              let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    private static func timestampedFileName(prefix: String, fileExtension: String) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return "\(prefix)-\(formatter.string(from: .now)).\(fileExtension)"
     }
 }
 
